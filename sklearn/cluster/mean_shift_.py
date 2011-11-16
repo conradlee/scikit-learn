@@ -8,12 +8,14 @@ Authors: Conrad Lee conradlee@gmail.com
 from collections import defaultdict
 import numpy as np
 
+from ..metrics.pairwise import euclidean_distances
 from ..utils import extmath, check_random_state
 from ..base import BaseEstimator
 from ..neighbors import BallTree
 
+KERNELS = ["flat", "gaussian"]
 
-def estimate_bandwidth(X, quantile=0.3, n_samples=None, random_state=0):
+def estimate_bandwidth(X, percentile=0.3, n_samples=None, random_state=0):
     """Estimate the bandwith to use with MeanShift algorithm
 
     Parameters
@@ -21,7 +23,7 @@ def estimate_bandwidth(X, quantile=0.3, n_samples=None, random_state=0):
     X: array [n_samples, n_features]
         Input points
 
-    quantile: float, default 0.3
+    percentile: float, default 0.3
         should be between [0, 1]
         0.5 means that the median is all pairwise distances is used
 
@@ -40,13 +42,22 @@ def estimate_bandwidth(X, quantile=0.3, n_samples=None, random_state=0):
     if n_samples is not None:
         idx = random_state.permutation(X.shape[0])[:n_samples]
         X = X[idx]
-    d, _ = BallTree(X).query(X, int(X.shape[0] * quantile),
+    d, _ = BallTree(X).query(X, int(X.shape[0] * percentile),
                              return_distance=True)
     bandwidth = np.mean(np.max(d, axis=1))
     return bandwidth
 
+# Define kernel update functions
 
-def mean_shift(X, bandwidth=None, seeds=None, bin_seeding=False,
+def flat_kernel_update(x, points, bandwidth):
+    return np.mean(points, axis=0)
+
+def gaussian_kernel_update(x, points, bandwidth):
+    distances = euclidean_distances(points, x)
+    weights = np.exp(-1 * (distances ** 2 / bandwidth ** 2))
+    return np.sum(points * weights, axis=0) / np.sum(weights)
+
+def mean_shift(X, bandwidth=None, seeds=None, kernel="flat", bin_seeding=False,
                cluster_all=True, max_iterations=300):
     """Perform MeanShift Clustering of data using a flat kernel
 
@@ -93,8 +104,25 @@ def mean_shift(X, bandwidth=None, seeds=None, bin_seeding=False,
     See examples/plot_meanshift.py for an example.
 
     """
+        
+    if not (kernel in KERNELS):
+        valid_kernels = " ".join(KERNELS)
+        raise ValueError, "Kernel %s is not valid. Valid kernel choices are: %s " % (kernel, valid_kernels)
+
     if bandwidth is None:
         bandwidth = estimate_bandwidth(X)
+
+    # Set maximum neighbor query distance based on kernel
+    if kernel in ["flat"]:
+        query_distance = bandwidth
+        kernel_update_function = flat_kernel_update
+        print "Using flat kernel update"
+    elif kernel in ["gaussian"]:
+        query_distance = bandwidth * 3 # A bit arbitrary
+        kernel_update_function = gaussian_kernel_update
+        print "Using gaussian kernel update"
+    else:
+        raise ValueError, "Kernel %s not implemented correctly" % kernel
     if seeds is None:
         if bin_seeding:
             seeds = get_bin_seeds(X, bandwidth)
@@ -106,19 +134,19 @@ def mean_shift(X, bandwidth=None, seeds=None, bin_seeding=False,
     ball_tree = BallTree(X)  # to efficiently look up nearby points
 
     # For each seed, climb gradient until convergence or max_iterations
-    for my_mean in seeds:
+    for weighted_mean in seeds:
         completed_iterations = 0
         while True:
             # Find mean of points within bandwidth
-            points_within = X[ball_tree.query_radius([my_mean], bandwidth)[0]]
+            points_within = X[ball_tree.query_radius([weighted_mean], query_distance)[0]]
             if len(points_within) == 0:
                 break  # Depending on seeding strategy this condition may occur
-            my_old_mean = my_mean  # save the old mean
-            my_mean = np.mean(points_within, axis=0)
+            old_mean = weighted_mean  # save the old mean
+            weighted_mean = kernel_update_function(old_mean, points_within, bandwidth)
             # If converged or at max_iterations, addS the cluster
-            if extmath.norm(my_mean - my_old_mean) < stop_thresh or \
+            if extmath.norm(weighted_mean - old_mean) < stop_thresh or \
                    completed_iterations == max_iterations:
-                center_intensity_dict[tuple(my_mean)] = len(points_within)
+                center_intensity_dict[tuple(weighted_mean)] = len(points_within)
                 break
             completed_iterations += 1
 
@@ -126,6 +154,7 @@ def mean_shift(X, bandwidth=None, seeds=None, bin_seeding=False,
     # If the distance between two kernels is less than the bandwidth,
     # then we have to remove one because it is a duplicate. Remove the
     # one with fewer points.
+    print "%d clusters before removing duplicates " % len(center_intensity_dict)
     sorted_by_intensity = sorted(center_intensity_dict.items(),
                                  key=lambda tup: tup[1], reverse=True)
     sorted_centers = np.array([tup[0] for tup in sorted_by_intensity])
@@ -137,7 +166,8 @@ def mean_shift(X, bandwidth=None, seeds=None, bin_seeding=False,
             unique[neighbor_idxs] = 0
             unique[i] = 1  # leave the current point as unique
     cluster_centers = sorted_centers[unique]
-
+    print "%d clusters after removing duplicates " % len(cluster_centers)
+    
     # ASSIGN LABELS: a point belongs to the cluster that it is closest to
     centers_tree = BallTree(cluster_centers)
     labels = np.zeros(n_points, dtype=np.int)
@@ -146,7 +176,7 @@ def mean_shift(X, bandwidth=None, seeds=None, bin_seeding=False,
         labels = idxs.flatten()
     else:
         labels[:] = -1
-        bool_selector = distances.flatten() <= bandwidth
+        bool_selector = distances.flatten() <= query_distance
         labels[bool_selector] = idxs.flatten()[bool_selector]
     return cluster_centers, labels
 
@@ -251,15 +281,15 @@ class MeanShift(BaseEstimator):
     Note that the estimate_bandwidth function is much less scalable than
     the mean shift algorithm and will be the bottleneck if it is used.
     """
-    def __init__(self, bandwidth=None, seeds=None, bin_seeding=False,
-                 cluster_all=True):
+    def __init__(self, bandwidth=None, kernel="flat", seeds=None,
+                 bin_seeding=False, cluster_all=True):
         self.bandwidth = bandwidth
         self.seeds = seeds
         self.bin_seeding = bin_seeding
         self.cluster_all = cluster_all
         self.cluster_centers_ = None
         self.labels_ = None
-
+        self.kernel = kernel
     def fit(self, X):
         """ Compute MeanShift
 
@@ -271,6 +301,7 @@ class MeanShift(BaseEstimator):
         self.cluster_centers_, self.labels_ = \
                                mean_shift(X,
                                           bandwidth=self.bandwidth,
+                                          kernel = self.kernel,
                                           seeds=self.seeds,
                                           bin_seeding=self.bin_seeding,
                                           cluster_all=self.cluster_all)
