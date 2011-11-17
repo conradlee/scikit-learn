@@ -69,7 +69,8 @@ def mean_shift(X, bandwidth=None, seeds=None, kernel="flat",
     if not seeds:
         seeds = X        
     elif len(seeds) == 0:
-        
+        raise ValueError, "If a list of seeds is provided it cannot be empty."
+
     if not (kernel in KERNELS):
         valid_kernels = " ".join(KERNELS)
         raise ValueError, "Kernel %s is not valid. Valid kernel choices are: %s " % (kernel, valid_kernels)
