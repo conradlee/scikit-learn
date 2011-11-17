@@ -15,38 +15,6 @@ from ..neighbors import BallTree
 
 KERNELS = ["flat", "gaussian"]
 
-def estimate_bandwidth(X, percentile=0.3, n_samples=None, random_state=0):
-    """Estimate the bandwith to use with MeanShift algorithm
-
-    Parameters
-    ----------
-    X: array [n_samples, n_features]
-        Input points
-
-    percentile: float, default 0.3
-        should be between [0, 1]
-        0.5 means that the median is all pairwise distances is used
-
-    n_samples: int
-        The number of samples to use. If None, all samples are used.
-
-    random_state: int or RandomState
-        Pseudo number generator state used for random sampling.
-
-    Returns
-    -------
-    bandwidth: float
-        The bandwidth parameter
-    """
-    random_state = check_random_state(random_state)
-    if n_samples is not None:
-        idx = random_state.permutation(X.shape[0])[:n_samples]
-        X = X[idx]
-    d, _ = BallTree(X).query(X, int(X.shape[0] * percentile),
-                             return_distance=True)
-    bandwidth = np.mean(np.max(d, axis=1))
-    return bandwidth
-
 # Define kernel update functions
 
 def flat_kernel_update(x, points, bandwidth):
@@ -57,38 +25,31 @@ def gaussian_kernel_update(x, points, bandwidth):
     weights = np.exp(-1 * (distances ** 2 / bandwidth ** 2))
     return np.sum(points * weights, axis=0) / np.sum(weights)
 
-def mean_shift(X, bandwidth=None, seeds=None, kernel="flat", bin_seeding=False,
-               cluster_all=True, max_iterations=300):
-    """Perform MeanShift Clustering of data using a flat kernel
-
-    Seed using a binning technique for scalability.
+def mean_shift(X, bandwidth=None, seeds=None, kernel="flat",
+               max_cluster_radius=-1., max_iterations=300):
+    """Perform MeanShift Clustering of data using the specified kernel
 
     Parameters
     ----------
 
     X : array [n_samples, n_features]
-        Input points
+        Input points to be clustered
 
-    bandwidth : float, optional
-        kernel bandwidth
-        If bandwidth is not defined, it is set using
-        a heuristic given by the median of all pairwise distances
+    bandwidth : float,
+        Kernel bandwidth
 
-    seeds: array [n_seeds, n_features]
-        point used as initial kernel locations
+    seeds: array [n_seeds, n_features], optional
+        Points used as initial kernel locations
+        If not set, then use every point as a seed (which may
+        be very slow---consider using the `get_bin_seeds` function
+        to create a reduced set of seeds.
 
-    bin_seeding: boolean
-        If true, initial kernel locations are not locations of all
-        points, but rather the location of the discretized version of
-        points, where points are binned onto a grid whose coarseness
-        corresponds to the bandwidth. Setting this option to True will speed
-        up the algorithm because fewer seeds will be initialized.
-        default value: False
-        Ignored if seeds argument is not None
-
-    min_bin_freq: int, optional
-       To speed up the algorithm, accept only those bins with at least
-       min_bin_freq points as seeds. If not defined, set to 1.
+    max_cluster_radius: float, default -1.
+        Used only in post-processing.
+        If negative, then each point is clustered into its nearest cluster.
+        If positive, then those points that are not within `max_cluster_radius`
+        of any cluster center are said to be 'orphans' that do not belong to
+        any cluster. Orphans are given cluster label -1.
 
     Returns
     -------
@@ -104,13 +65,14 @@ def mean_shift(X, bandwidth=None, seeds=None, kernel="flat", bin_seeding=False,
     See examples/plot_meanshift.py for an example.
 
     """
+
+    if not seeds:
+        seeds = X        
+    elif len(seeds) == 0:
         
     if not (kernel in KERNELS):
         valid_kernels = " ".join(KERNELS)
         raise ValueError, "Kernel %s is not valid. Valid kernel choices are: %s " % (kernel, valid_kernels)
-
-    if bandwidth is None:
-        bandwidth = estimate_bandwidth(X)
 
     # Set maximum neighbor query distance based on kernel
     if kernel in ["flat"]:
@@ -123,11 +85,7 @@ def mean_shift(X, bandwidth=None, seeds=None, kernel="flat", bin_seeding=False,
         print "Using gaussian kernel update"
     else:
         raise ValueError, "Kernel %s not implemented correctly" % kernel
-    if seeds is None:
-        if bin_seeding:
-            seeds = get_bin_seeds(X, bandwidth)
-        else:
-            seeds = X
+
     n_points, n_features = X.shape
     stop_thresh = 1e-3 * bandwidth  # when mean has converged
     center_intensity_dict = {}
@@ -172,16 +130,16 @@ def mean_shift(X, bandwidth=None, seeds=None, kernel="flat", bin_seeding=False,
     centers_tree = BallTree(cluster_centers)
     labels = np.zeros(n_points, dtype=np.int)
     distances, idxs = centers_tree.query(X, 1)
-    if cluster_all:
+    if max_cluster_radius < 0:
         labels = idxs.flatten()
     else:
         labels[:] = -1
-        bool_selector = distances.flatten() <= query_distance
+        bool_selector = distances.flatten() <= max_cluster_radius
         labels[bool_selector] = idxs.flatten()[bool_selector]
     return cluster_centers, labels
 
 
-def get_bin_seeds(X, bin_size, min_bin_freq=1):
+def get_bin_seeds(X, bin_size, min_bin_freq):
     """Finds seeds for mean_shift
 
     Finds seeds by first binning data onto a grid whose lines are
@@ -200,7 +158,7 @@ def get_bin_seeds(X, bin_size, min_bin_freq=1):
         not sure how to set this, set it to the value of the bandwidth used
         in clustering.mean_shift
 
-    min_bin_freq: integer, default 1
+    min_bin_freq: integer
         Only bins with at least min_bin_freq will be selected as seeds.
         Raising this value decreases the number of seeds found, which
         makes mean_shift computationally cheaper.
@@ -235,15 +193,17 @@ class MeanShift(BaseEstimator):
         See clustering.estimate_bandwidth
 
     seeds: array [n_samples, n_features], optional
-        Seeds used to initialize kernels. If not set,
-        the seeds are calculated by clustering.get_bin_seeds
-        with bandwidth as the grid size and default values for
-        other parameters.
+        Seeds used to initialize kernels. If not specified, every
+        point is used as a seed, which can be slow. To speed up
+        the algorithm, consider creating a reduced set of seeds using
+        the get_binned_seeds function.
 
-    cluster_all: boolean, default True
-        If true, then all points are clustered, even those orphans that are
-        not within any kernel. Orphans are assigned to the nearest kernel.
-        If false, then orphans are given cluster label -1.
+    max_cluster_radius: float, default -1.
+        Used only in post-processing.
+        If negative, then each point is clustered into its nearest cluster.
+        If positive, then those points that are not within `max_cluster_radius`
+        of any cluster center are said to be 'orphans' that do not belong to
+        any cluster. Orphans are given cluster label -1.
 
     Methods
     -------
@@ -275,21 +235,23 @@ class MeanShift(BaseEstimator):
     and T the number of points. In higher dimensions the complexity will
     tend towards O(T*n^2).
 
-    Scalability can be boosted by using fewer seeds, for examply by using
-    a higher value of min_bin_freq in the get_bin_seeds function.
+    Scalability can be boosted by using fewer seeds, for examply by 
+    creating a reduced set of seeds using the get_binned_seeds function
+    and using those as the `seeds` argument.
+
 
     Note that the estimate_bandwidth function is much less scalable than
     the mean shift algorithm and will be the bottleneck if it is used.
     """
     def __init__(self, bandwidth=None, kernel="flat", seeds=None,
-                 bin_seeding=False, cluster_all=True):
+                 max_cluster_radius=-1.):
         self.bandwidth = bandwidth
         self.seeds = seeds
-        self.bin_seeding = bin_seeding
-        self.cluster_all = cluster_all
+        self.max_cluster_radius = max_cluster_radius
         self.cluster_centers_ = None
         self.labels_ = None
         self.kernel = kernel
+
     def fit(self, X):
         """ Compute MeanShift
 
@@ -303,6 +265,5 @@ class MeanShift(BaseEstimator):
                                           bandwidth=self.bandwidth,
                                           kernel = self.kernel,
                                           seeds=self.seeds,
-                                          bin_seeding=self.bin_seeding,
-                                          cluster_all=self.cluster_all)
+                                          max_cluster_radius=self.max_cluster_radius)
         return self
