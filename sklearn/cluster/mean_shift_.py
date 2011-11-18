@@ -66,7 +66,7 @@ def mean_shift(X, bandwidth=None, seeds=None, kernel="flat",
 
     """
 
-    if not seeds:
+    if seeds is None:
         seeds = X        
     elif len(seeds) == 0:
         raise ValueError, "If a list of seeds is provided it cannot be empty."
